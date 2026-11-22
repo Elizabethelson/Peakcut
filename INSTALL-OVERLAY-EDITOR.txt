@@ -1,0 +1,43 @@
+PeakCut optional Overlay Editor update
+
+This update adds an optional chroma-key video overlay editor to completed clips.
+It does not change the clip-generation pipeline or add Python dependencies.
+It uses the FFmpeg/FFprobe already required by PeakCut.
+
+FILES TO REPLACE (keep the folder structure):
+  studio/server.py
+  web/index.html
+
+SAFE INSTALL ON WINDOWS:
+1. Stop PeakCut (in the PowerShell window running the server, press Ctrl+C).
+2. Open your PeakCut folder: %USERPROFILE%\PeakCut\app
+3. Make a backup copy of the existing files:
+     studio\server.py  -> server.py.before-overlay
+     web\index.html    -> index.html.before-overlay
+4. Extract this ZIP into %USERPROFILE%\PeakCut\app and allow it to replace ONLY those two files.
+5. Start PeakCut as usual:
+     Set-Location "$HOME\PeakCut\app"; .\.venv\Scripts\python.exe -m studio.server
+6. Open http://127.0.0.1:8765, open a completed clip, and find "Optional logo / video overlay".
+
+USAGE:
+- Select an MP4, MOV, M4V or WebM overlay video.
+- Set size as a percentage of the 1080px output width.
+- Set X/Y position from 0 to 100 (0 = top/left, 100 = bottom/right).
+- Set start/end seconds for the overlay.
+- Green removal is tuned for a pure green (#00FF00) background.
+- Click Apply overlay and render.
+
+SAFETY / RESTORE:
+- The app writes a .before-overlay.mp4 backup of the clip before replacing it.
+- It renders to a temporary file and replaces the clip only after FFmpeg succeeds.
+- To undo an overlay, stop PeakCut and replace the current clip MP4 with its matching
+  .before-overlay.mp4 backup (remove the .before-overlay suffix from the restored name).
+- To remove this feature, restore the two .before-overlay source backups from step 3.
+
+NOTES:
+- This editor is intended for your own channel branding or other non-gambling overlays.
+- The preview shown before applying is the selected source clip; the composited result is
+  shown after rendering. This first version does not provide drag-and-drop positioning.
+- Full project tests: syntax checks passed; FFmpeg chroma-key/scale/position smoke test passed.
+  The broader test runner passed its first two groups (96 checks) but timed out during the
+  queue-load group in this environment, so the entire suite is not claimed as passed.

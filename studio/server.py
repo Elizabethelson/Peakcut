@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -101,8 +102,9 @@ class Gate:
             # Only the upload may be big. Everything else is a small form, and is cut off at 256 KB whatever its
             # headers claim, so nobody can fill the server's memory by posting junk (signed in or not).
             piece = method == "PUT" and path.startswith("/api/upload/")
+            overlay_upload = method == "POST" and path.startswith("/api/jobs/") and path.endswith("/overlay")
             cap = ((min(config.MAX_UPLOAD_MB, config.UPLOAD_PART_MB) if piece else config.MAX_UPLOAD_MB) + 8) * 1024 * 1024 \
-                if path == "/api/upload" or piece else 256 * 1024
+                if path == "/api/upload" or piece or overlay_upload else 256 * 1024
             try:
                 if int(req.headers.get("content-length") or 0) > cap:
                     return await deny(413, f"That file is too big. The limit is {config.MAX_UPLOAD_MB} MB." if path == "/api/upload" else "That request is too large.")
@@ -943,6 +945,99 @@ def rerender(jid: str, cid: str, body: dict = Body(...)):
     return jobs.public(job)
 
 
+@app.post("/api/jobs/{jid}/clips/{cid}/overlay")
+async def apply_clip_overlay(jid: str, cid: str, file: UploadFile = File(...),
+                             width: float = Form(24), x: float = Form(50), y: float = Form(84),
+                             start: float = Form(0), end: float = Form(60),
+                             similarity: float = Form(0.25), blend: float = Form(0.08)):
+    """Apply an optional chroma-keyed video overlay to a finished clip, keeping its original audio."""
+    job = _job_or_404(jid)
+    clip = next((c for c in job.get("clips", []) if c.get("id") == cid), None)
+    if not clip or clip.get("status") != "done":
+        raise HTTPException(409, "Wait until this clip has finished before adding an overlay.")
+    if job.get("status") in ("queued", "running"):
+        raise HTTPException(409, "Wait until video processing has finished.")
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in {".mp4", ".mov", ".m4v", ".webm"}:
+        raise HTTPException(400, "Choose an MP4, MOV, M4V or WebM overlay video.")
+    try:
+        width, x, y = float(width), float(x), float(y)
+        start, end = float(start), float(end)
+        similarity, blend = float(similarity), float(blend)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Overlay settings must be numbers.")
+    if not (5 <= width <= 90 and 0 <= x <= 100 and 0 <= y <= 100 and 0 <= start < end <= 3600
+            and 0.05 <= similarity <= 0.6 and 0 <= blend <= 0.3):
+        raise HTTPException(400, "One or more overlay settings are outside the allowed range.")
+
+    clip_dir = Path(job["dir"]) / "clips"
+    original = clip_dir / str(clip.get("file", ""))
+    if not original.is_file() or not re.fullmatch(r"[\w\-]+\.mp4", original.name):
+        raise HTTPException(404, "The finished clip file could not be found.")
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    incoming = clip_dir / ("overlay-" + str(time.time_ns()) + ext)
+    output = clip_dir / ("render-" + str(time.time_ns()) + ".mp4")
+    try:
+        size = 0
+        with incoming.open("wb") as dst:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > config.MAX_UPLOAD_MB * 1024 * 1024:
+                    raise HTTPException(413, f"Overlay video exceeds the {config.MAX_UPLOAD_MB} MB upload limit.")
+                dst.write(chunk)
+        if size < 1024:
+            raise HTTPException(400, "The overlay video is empty or too small.")
+
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(original)],
+                               capture_output=True, text=True, timeout=20, creationflags=media.NO_WINDOW)
+        duration = float(probe.stdout.strip()) if probe.returncode == 0 else 0
+        if duration <= 0:
+            raise HTTPException(400, "Could not read the finished clip duration.")
+        if end > duration:
+            end = duration
+        if start >= end:
+            raise HTTPException(400, "Overlay start time must be before its end time and inside the clip.")
+
+        # Chroma-key only the uploaded overlay. Scale by output width while preserving its aspect ratio.
+        filt = (f"[1:v]format=rgba,chromakey=0x00FF00:{similarity:.3f}:{blend:.3f},"
+                f"scale=w=\'min(iw\\,1080*{width/100:.4f})\':h=-2[ov];"
+                f"[0:v][ov]overlay=x='(W-w)*{x/100:.4f}':y='(H-h)*{y/100:.4f}':"
+                f"eof_action=pass:enable='between(t,{start:.3f},{end:.3f})'[v]")
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(original), "-i", str(incoming),
+               "-filter_complex", filt, "-map", "[v]", "-map", "0:a?", "-c:v", "libx264",
+               "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac",
+               "-b:a", "160k", "-movflags", "+faststart", "-t", f"{duration:.3f}", str(output)]
+        result = await run_in_threadpool(subprocess.run, cmd, capture_output=True, text=True,
+                                         timeout=600, creationflags=media.NO_WINDOW)
+        if result.returncode != 0 or not output.is_file() or output.stat().st_size < 1024:
+            raise HTTPException(500, "Overlay render failed. The original clip has been kept unchanged.")
+        # Atomic replace: original is untouched until the new MP4 has rendered successfully.
+        backup = original.with_name(original.stem + ".before-overlay.mp4")
+        if not backup.exists():
+            shutil.copy2(original, backup)
+        os.replace(output, original)
+        cover = clip_dir / str(clip.get("cover", ""))
+        if cover.name and re.fullmatch(r"[\w\-]+\.jpg", cover.name):
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", str(original), "-frames:v", "1", "-q:v", "3", str(cover)],
+                           capture_output=True, timeout=30, creationflags=media.NO_WINDOW)
+        clip["version"] = int(clip.get("version", 0)) + 1
+        jobs.save(job)
+        return {"ok": True, "version": clip["version"], "message": "Overlay applied. Original clip backup was kept."}
+    except HTTPException:
+        raise
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Overlay render took too long. The original clip has been kept unchanged.")
+    except OSError:
+        raise HTTPException(500, "Could not save the overlay render. The original clip has been kept unchanged.")
+    finally:
+        await file.close()
+        incoming.unlink(missing_ok=True)
+        output.unlink(missing_ok=True)
+
+
 @app.delete("/api/jobs/{jid}")
 def delete_job(jid: str):
     job = _job_or_404(jid)
@@ -1024,7 +1119,7 @@ def delete_my_account(request: Request, body: dict = Body(...)):
 
 @app.get("/media/{jid}/{name}")
 def media_file(jid: str, name: str, download: int = 0):
-    if not re.fullmatch(r"[\w\-]+\.(mp4|jpg)", name):
+    if not re.fullmatch(r"[\w\-]+\.(mp4|jpg|webm)", name):
         raise HTTPException(404)
     f = Path(_job_or_404(jid)["dir"]) / "clips" / name
     if not f.is_file():
